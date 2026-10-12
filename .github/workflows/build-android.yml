@@ -1,6 +1,221 @@
+name: Build Android APK
+# AndroidForge — Universal Android APK Builder with DramaHub release signing.
 
-      # Step 13: Sign APK and upload signed artifact
-      - name: Sign APK with DramaHub keystore
+on:
+  workflow_dispatch:
+    inputs:
+      zip_source:
+        description: "Where should the workflow get the source ZIP from?"
+        type: choice
+        required: true
+        default: "input-directory"
+        options:
+          - "input-directory"
+          - "download-url"
+          - "release-asset"
+      zip_path:
+        description: "Exact path of the source ZIP in input/ when multiple ZIPs exist"
+        required: false
+        type: string
+        default: ""
+      zip_url:
+        description: "Direct download URL (only used with download-url)"
+        required: false
+        type: string
+        default: ""
+      release_tag:
+        description: "GitHub Release tag containing the ZIP (only used with release-asset)"
+        required: false
+        type: string
+        default: ""
+      build_variant:
+        description: "Build variant to produce"
+        type: choice
+        required: true
+        default: "auto"
+        options:
+          - "auto"
+          - "debug"
+          - "release"
+          - "bundle"
+      enable_ndk:
+        description: "Install NDK even if no native code is detected"
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - "input/**.zip"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: androidforge-build-${{ github.ref }}-${{ github.event.inputs.zip_source || 'auto' }}
+  cancel-in-progress: false
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.caching=false"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build:
+    name: Build and sign APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      build_succeeded: ${{ steps.build.outputs.build_succeeded }}
+      apk_count: ${{ steps.collect.outputs.apk_count }}
+      primary_apk_name: ${{ steps.collect.outputs.primary_apk_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Acquire source ZIP
+        id: acquire
+        run: |
+          python scripts/acquire_zip.py \
+            --source "${{ inputs.zip_source || 'input-directory' }}" \
+            --url "${{ inputs.zip_url }}" \
+            --tag "${{ inputs.release_tag }}" \
+            --path "${{ inputs.zip_path }}"
+
+      - name: Extract source ZIP
+        id: extract
+        run: |
+          python scripts/extract_zip.py --zip "${{ steps.acquire.outputs.zip_path }}"
+
+      - name: Detect project type
+        id: detect
+        run: |
+          python scripts/detect_project.py \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --output detection.json
+          cat detection.json
+
+      - name: Configure toolchain
+        id: toolchain
+        run: |
+          python scripts/setup_environment.py \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect detection.json \
+            --android-sdk "$ANDROID_SDK_ROOT" \
+            --output toolchain.json
+          cat toolchain.json
+
+      - name: Set up JDK (detected version)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "${{ steps.toolchain.outputs.jdk_version }}"
+          cache: gradle
+
+      - name: Set up Android SDK
+        id: sdk_action
+        continue-on-error: true
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools build-tools;34.0.0 build-tools;33.0.2 build-tools;32.0.0 build-tools;30.0.3 platforms;android-34 platforms;android-33 platforms;android-31 platforms;android-30 platforms;android-29 platforms;android-28 platforms;android-26 platforms;android-25"
+
+      - name: Install Android SDK packages fallback
+        if: steps.sdk_action.outcome == 'failure'
+        run: |
+          SDKMGR="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          test -n "$SDKMGR"
+          for pkg in "platform-tools" "build-tools;34.0.0" "build-tools;33.0.2" "platforms;android-34" "platforms;android-33"; do
+            yes | "$SDKMGR" "$pkg" >/dev/null 2>&1 || true
+          done
+
+      - name: Install NDK (detected version)
+        if: steps.toolchain.outputs.needs_ndk == 'true' || inputs.enable_ndk == true
+        run: |
+          SDKMGR="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          test -n "$SDKMGR"
+          yes | "$SDKMGR" "ndk;${{ steps.toolchain.outputs.ndk_version }}" || true
+          yes | "$SDKMGR" "cmake;3.22.1" || true
+
+      - name: Set up Flutter
+        if: steps.toolchain.outputs.needs_flutter == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "${{ steps.toolchain.outputs.flutter_version }}"
+          channel: stable
+          cache: true
+
+      - name: Install standalone Gradle (fallback)
+        if: steps.toolchain.outputs.use_wrapper == 'false'
+        run: |
+          GRADLE_VER="${{ steps.toolchain.outputs.gradle_version }}"
+          wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-${GRADLE_VER}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Gradle dependencies
+        if: steps.toolchain.outputs.needs_gradle == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ steps.extract.outputs.project_root }}/.gradle
+          key: gradle-${{ steps.toolchain.outputs.gradle_version }}-${{ hashFiles('**/build.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ steps.toolchain.outputs.gradle_version }}-
+            gradle-
+
+      - name: Build project
+        id: build
+        continue-on-error: true
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/build_project.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --variant "${{ inputs.build_variant || 'auto' }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs" \
+            --output "$GITHUB_WORKSPACE/build.json" || true
+          if [ ! -f "$GITHUB_WORKSPACE/build.json" ]; then
+            echo '{"build_succeeded": false, "successful_command": null, "exit_code": -1, "log_file": null}' > "$GITHUB_WORKSPACE/build.json"
+          fi
+          cat "$GITHUB_WORKSPACE/build.json"
+
+      - name: Collect APKs
+        id: collect
+        if: always()
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/collect_apk.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --variant "${{ inputs.build_variant || 'auto' }}" \
+            --output-dir "$GITHUB_WORKSPACE/output" \
+            --output-json "$GITHUB_WORKSPACE/collect.json" || true
+          if [ ! -f "$GITHUB_WORKSPACE/collect.json" ]; then
+            echo '{"apk_count": 0, "primary": null, "all_apks": []}' > "$GITHUB_WORKSPACE/collect.json"
+          fi
+          cat "$GITHUB_WORKSPACE/collect.json"
+
+      # IMPORTANT: sign after collecting, before artifacts and release upload.
+      - name: Sign APKs with DramaHub release keystore
         if: steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -8,61 +223,119 @@
         shell: bash
         run: |
           set -euo pipefail
-
-          test -n "$KEYSTORE_BASE64" || {
-            echo "::error::ANDROID_KEYSTORE_BASE64 is missing"
+          if [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" ]]; then
+            echo "::error::Missing ANDROID_KEYSTORE_BASE64 or ANDROID_KEYSTORE_PASSWORD repository secret."
             exit 1
-          }
-
-          test -n "$KEYSTORE_PASSWORD" || {
-            echo "::error::ANDROID_KEYSTORE_PASSWORD is missing"
-            exit 1
-          }
+          fi
 
           KEYSTORE="$RUNNER_TEMP/dramahub-release-v2.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
           chmod 600 "$KEYSTORE"
+          trap 'rm -f "$KEYSTORE"' EXIT
 
-          APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" \
-            -type f -name apksigner | sort -V | tail -n 1)"
-
-          test -x "$APKSIGNER" || {
-            echo "::error::apksigner not found"
-            exit 1
-          }
-
-          shopt -s nullglob
-          APK_FILES=("$GITHUB_WORKSPACE/output"/*.apk)
-
-          if [ ${#APK_FILES[@]} -eq 0 ]; then
-            echo "::error::No APK files found in output directory"
+          APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [[ -z "$APKSIGNER" || ! -x "$APKSIGNER" ]]; then
+            echo "::error::apksigner not found in Android SDK build-tools."
             exit 1
           fi
 
-          for APK in "${APK_FILES[@]}"; do
-            TEMP_APK="${APK}.signed"
+          APK_DIR="$GITHUB_WORKSPACE/output"
+          shopt -s nullglob
+          APKS=("$APK_DIR"/*.apk)
+          if (( ${#APKS[@]} == 0 )); then
+            echo "::error::Collector reported APKs, but no APK files were found in $APK_DIR."
+            exit 1
+          fi
 
+          for APK in "${APKS[@]}"; do
+            TEMP_APK="${APK}.signed"
+            echo "Signing $(basename "$APK")"
             "$APKSIGNER" sign \
               --ks "$KEYSTORE" \
               --ks-key-alias dramahub \
               --ks-pass env:KEYSTORE_PASSWORD \
               --key-pass env:KEYSTORE_PASSWORD \
-              --out "$TEMP_APK" \
-              "$APK"
-
+              --out "$TEMP_APK" "$APK"
             "$APKSIGNER" verify --verbose "$TEMP_APK"
             mv "$TEMP_APK" "$APK"
-            echo "Signed: $(basename "$APK")"
           done
-
-          rm -f "$KEYSTORE"
 
       - name: Upload APK artifact
         if: steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
         uses: actions/upload-artifact@v4
         with:
-          name: AndroidForge-APKs
+          name: DramaHub-signed-APKs
           path: ${{ steps.collect.outputs.apk_directory }}/*.apk
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+      - name: Upload AAB artifact (if any)
+        if: steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-AAB
+          path: ${{ steps.collect.outputs.apk_directory }}/*.aab
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Publish signed APKs to output release
+        if: always() && steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="web-build-output-${{ github.run_id }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "Build #${{ github.run_number }} output" \
+            --notes "Auto-generated by AndroidForge workflow run ${{ github.run_id }}." \
+            --prerelease || true
+          cd "$GITHUB_WORKSPACE/output"
+          shopt -s nullglob
+          for f in *.apk *.aab; do
+            gh release upload "$TAG" "$f" --clobber --repo "$GITHUB_REPOSITORY" || echo "WARNING: upload of $f failed"
+          done
+          echo "output_release_tag=$TAG" >> "$GITHUB_ENV"
+          {
+            echo "## Output release"
+            echo
+            echo "Tag: $TAG"
+            echo "URL: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AndroidForge-logs
+          path: |
+            .androidforge/logs/
+            ${{ steps.extract.outputs.project_root }}/build/outputs/
+            ${{ steps.extract.outputs.project_root }}/**/build/reports/
+            ${{ steps.extract.outputs.project_root }}/**/build/outputs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Diagnose failure
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/diagnose_failure.py" \
+            --root "${{ steps.extract.outputs.project_root }}" \
+            --log-dir "$GITHUB_WORKSPACE/.androidforge/logs" || true
+
+      - name: Build summary
+        if: always()
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/build_summary.py" \
+            --detect "$GITHUB_WORKSPACE/detection.json" \
+            --toolchain "$GITHUB_WORKSPACE/toolchain.json" \
+            --build "$GITHUB_WORKSPACE/build.json" \
+            --collect "$GITHUB_WORKSPACE/collect.json" || true
+
+      - name: Fail if build failed
+        if: steps.build.outputs.build_succeeded != 'true'
+        run: |
+          echo "::error::Android build failed. See the diagnosis above and AndroidForge-logs artifact."
+          exit 1
