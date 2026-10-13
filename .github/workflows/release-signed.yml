@@ -5,14 +5,18 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout AndroidForge repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -41,61 +45,139 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Find and extract latest DramaHub source ZIP
+      - name: Find newest committed DramaHub source ZIP
         id: source
         shell: bash
         run: |
           set -euo pipefail
-          ZIP_FILE="$(find input -maxdepth 2 -type f -iname '*.zip' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)"
-          if [[ -z "${ZIP_FILE:-}" ]]; then
-            echo 'Tidak menemukan ZIP source di folder input/. Upload ZIP DramaHub ke input/ terlebih dahulu.' >&2
+
+          mkdir -p input
+          ZIP_FILE=""
+          BEST_COMMIT_TIME=-1
+
+          while IFS= read -r -d '' candidate; do
+            COMMIT_TIME="$(git log -1 --format=%ct -- "$candidate" 2>/dev/null || true)"
+            [[ "$COMMIT_TIME" =~ ^[0-9]+$ ]] || COMMIT_TIME=0
+            if (( COMMIT_TIME > BEST_COMMIT_TIME )); then
+              BEST_COMMIT_TIME="$COMMIT_TIME"
+              ZIP_FILE="$candidate"
+            fi
+          done < <(find input -maxdepth 2 -type f -iname '*.zip' -print0)
+
+          if [[ -z "$ZIP_FILE" ]]; then
+            echo 'Tidak menemukan ZIP source di folder input/.' >&2
             exit 1
           fi
-          echo "Source ZIP: $ZIP_FILE"
+
+          echo "Source ZIP terpilih: $ZIP_FILE"
+          echo "Commit time: $BEST_COMMIT_TIME"
           mkdir -p "$RUNNER_TEMP/dramahub-source"
           unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/dramahub-source"
-          PROJECT_DIR="$(find "$RUNNER_TEMP/dramahub-source" -type f -name settings.gradle -print -quit | xargs -r dirname)"
-          if [[ -z "${PROJECT_DIR:-}" ]] || [[ ! -f "$PROJECT_DIR/app/build.gradle" ]]; then
-            echo 'Struktur ZIP tidak cocok: settings.gradle dan app/build.gradle tidak ditemukan bersama.' >&2
-            find "$RUNNER_TEMP/dramahub-source" -maxdepth 4 -type f | head -80
+
+          PROJECT_DIR=""
+          while IFS= read -r -d '' settings_file; do
+            candidate_dir="$(dirname "$settings_file")"
+            if [[ -f "$candidate_dir/app/build.gradle" || -f "$candidate_dir/app/build.gradle.kts" ]]; then
+              PROJECT_DIR="$candidate_dir"
+              break
+            fi
+          done < <(find "$RUNNER_TEMP/dramahub-source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print0)
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo 'Struktur ZIP tidak cocok: settings.gradle dan app/build.gradle(.kts) tidak ditemukan bersama.' >&2
+            find "$RUNNER_TEMP/dramahub-source" -maxdepth 5 -type f | head -100
             exit 1
           fi
+
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "Project root: $PROJECT_DIR"
+
+      - name: Set versionCode for this release
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          GRADLE_FILE="$PROJECT_DIR/app/build.gradle"
+          [[ -f "$GRADLE_FILE" ]] || { echo 'File app/build.gradle (Groovy) tidak ditemukan.' >&2; exit 1; }
+
+          # Gunakan nomor versi rilis yang selalu meningkat dan cukup tinggi untuk menghindari versionCode lama.
+          NEW_VERSION_CODE=$((10000 + BUILD_NUMBER))
+          if grep -Eq '^[[:space:]]*versionCode[[:space:]]+[0-9]+' "$GRADLE_FILE"; then
+            sed -E -i "s/^[[:space:]]*versionCode[[:space:]]+[0-9]+/        versionCode $NEW_VERSION_CODE/" "$GRADLE_FILE"
+          elif grep -Eq '^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*[0-9]+' "$GRADLE_FILE"; then
+            sed -E -i "s/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*[0-9]+/        versionCode = $NEW_VERSION_CODE/" "$GRADLE_FILE"
+          else
+            echo 'Tidak menemukan versionCode angka statis pada app/build.gradle. Hentikan agar tidak mengubah proyek secara keliru.' >&2
+            grep -n -E 'versionCode|defaultConfig' "$GRADLE_FILE" || true
+            exit 1
+          fi
+
+          echo "versionCode rilis: $NEW_VERSION_CODE"
+          grep -n 'versionCode' "$GRADLE_FILE"
 
       - name: Decode release keystore
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ -z "${KEYSTORE_BASE64:-}" ]]; then
-            echo 'Secret ANDROID_KEYSTORE_BASE64 belum diisi.' >&2
+          if [[ -z "${KEYSTORE_BASE64:-}" || -z "${KEYSTORE_PASSWORD:-}" ]]; then
+            echo 'Secret ANDROID_KEYSTORE_BASE64 atau ANDROID_KEYSTORE_PASSWORD belum diisi.' >&2
             exit 1
           fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/dramahub-release-v2.jks"
-          test -s "$RUNNER_TEMP/dramahub-release-v2.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/dramahub-release.jks"
+          test -s "$RUNNER_TEMP/dramahub-release.jks"
+          keytool -list -keystore "$RUNNER_TEMP/dramahub-release.jks" \
+            -storepass "$KEYSTORE_PASSWORD" >/dev/null
 
       - name: Build signed release APK
         shell: bash
         env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ -z "${KEYSTORE_PASSWORD:-}" ]]; then
-            echo 'Secret ANDROID_KEYSTORE_PASSWORD belum diisi.' >&2
+          [[ -n "${KEYSTORE_PASSWORD:-}" ]] || { echo 'Secret ANDROID_KEYSTORE_PASSWORD belum diisi.' >&2; exit 1; }
+          KEY_ALIAS="${KEY_ALIAS:-dramahub}"
+          KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+
+          gradle --no-daemon -p "$PROJECT_DIR" assembleRelease \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/dramahub-release.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Verify and stage signed release APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*' -print -quit)"
+          if [[ -z "$APK" ]]; then
+            echo 'APK release tidak ditemukan.' >&2
+            find "$PROJECT_DIR/app/build/outputs" -type f -maxdepth 6 || true
             exit 1
           fi
-          gradle --no-daemon -p "${{ steps.source.outputs.project_dir }}" assembleRelease \
-            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/dramahub-release-v2.jks" \
-            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias=dramahub \
-            -Pandroid.injected.signing.key.password="$KEYSTORE_PASSWORD"
 
-      - name: Upload signed APK
+          APKSIGNER="/usr/local/lib/android/sdk/build-tools/35.0.0/apksigner"
+          [[ -x "$APKSIGNER" ]] || APKSIGNER="$(find /usr/local/lib/android/sdk/build-tools -type f -name apksigner -print -quit)"
+          [[ -x "$APKSIGNER" ]] || { echo 'apksigner tidak ditemukan.' >&2; exit 1; }
+          "$APKSIGNER" verify --verbose "$APK"
+
+          mkdir -p release-output
+          cp "$APK" release-output/DramaHub-release-signed.apk
+          sha256sum release-output/DramaHub-release-signed.apk
+
+      - name: Upload signed APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: DramaHub-signed-release
-          path: ${{ steps.source.outputs.project_dir }}/app/build/outputs/apk/release/*.apk
+          path: release-output/DramaHub-release-signed.apk
           if-no-files-found: error
           retention-days: 14
