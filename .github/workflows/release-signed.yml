@@ -50,8 +50,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p input
           ZIP_FILE=""
           BEST_COMMIT_TIME=-1
 
@@ -70,21 +68,20 @@ jobs:
           fi
 
           echo "Source ZIP terpilih: $ZIP_FILE"
-          echo "Commit time: $BEST_COMMIT_TIME"
           mkdir -p "$RUNNER_TEMP/dramahub-source"
           unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/dramahub-source"
 
           PROJECT_DIR=""
           while IFS= read -r -d '' settings_file; do
             candidate_dir="$(dirname "$settings_file")"
-            if [[ -f "$candidate_dir/app/build.gradle" || -f "$candidate_dir/app/build.gradle.kts" ]]; then
+            if [[ -f "$candidate_dir/app/build.gradle" ]]; then
               PROJECT_DIR="$candidate_dir"
               break
             fi
           done < <(find "$RUNNER_TEMP/dramahub-source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print0)
 
           if [[ -z "$PROJECT_DIR" ]]; then
-            echo 'Struktur ZIP tidak cocok: settings.gradle dan app/build.gradle(.kts) tidak ditemukan bersama.' >&2
+            echo 'Struktur ZIP tidak cocok: settings.gradle dan app/build.gradle tidak ditemukan bersama.' >&2
             find "$RUNNER_TEMP/dramahub-source" -maxdepth 5 -type f | head -100
             exit 1
           fi
@@ -100,21 +97,34 @@ jobs:
         run: |
           set -euo pipefail
           GRADLE_FILE="$PROJECT_DIR/app/build.gradle"
-          [[ -f "$GRADLE_FILE" ]] || { echo 'File app/build.gradle (Groovy) tidak ditemukan.' >&2; exit 1; }
+          [[ -f "$GRADLE_FILE" ]] || { echo 'File app/build.gradle tidak ditemukan.' >&2; exit 1; }
 
-          # Gunakan nomor versi rilis yang selalu meningkat dan cukup tinggi untuk menghindari versionCode lama.
+          # Source DramaHub memakai ekspresi versionCode (misalnya Math.max(...)),
+          # jadi ganti seluruh ekspresi dengan angka yang meningkat tiap workflow run.
           NEW_VERSION_CODE=$((10000 + BUILD_NUMBER))
-          if grep -Eq '^[[:space:]]*versionCode[[:space:]]+[0-9]+' "$GRADLE_FILE"; then
-            sed -E -i "s/^[[:space:]]*versionCode[[:space:]]+[0-9]+/        versionCode $NEW_VERSION_CODE/" "$GRADLE_FILE"
-          elif grep -Eq '^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*[0-9]+' "$GRADLE_FILE"; then
-            sed -E -i "s/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*[0-9]+/        versionCode = $NEW_VERSION_CODE/" "$GRADLE_FILE"
-          else
-            echo 'Tidak menemukan versionCode angka statis pada app/build.gradle. Hentikan agar tidak mengubah proyek secara keliru.' >&2
-            grep -n -E 'versionCode|defaultConfig' "$GRADLE_FILE" || true
-            exit 1
-          fi
+          python3 - "$GRADLE_FILE" "$NEW_VERSION_CODE" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
 
-          echo "versionCode rilis: $NEW_VERSION_CODE"
+          file_path = Path(sys.argv[1])
+          new_code = int(sys.argv[2])
+          text = file_path.read_text(encoding="utf-8")
+          pattern = re.compile(r"^(\s*)versionCode\s+.*$", re.MULTILINE)
+          updated, count = pattern.subn(
+              lambda match: f"{match.group(1)}versionCode({new_code})",
+              text,
+              count=1,
+          )
+          if count != 1:
+              print("Tidak menemukan baris versionCode di app/build.gradle.", file=sys.stderr)
+              for number, line in enumerate(text.splitlines(), 1):
+                  if "versionCode" in line or "defaultConfig" in line:
+                      print(f"{number}: {line}", file=sys.stderr)
+              sys.exit(1)
+          file_path.write_text(updated, encoding="utf-8")
+          print(f"versionCode rilis: {new_code}")
+          PY
           grep -n 'versionCode' "$GRADLE_FILE"
 
       - name: Decode release keystore
@@ -161,7 +171,7 @@ jobs:
           APK="$(find "$PROJECT_DIR/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*' -print -quit)"
           if [[ -z "$APK" ]]; then
             echo 'APK release tidak ditemukan.' >&2
-            find "$PROJECT_DIR/app/build/outputs" -type f -maxdepth 6 || true
+            find "$PROJECT_DIR/app/build/outputs" -maxdepth 6 -type f || true
             exit 1
           fi
 
