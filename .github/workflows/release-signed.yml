@@ -21,13 +21,22 @@ jobs:
           java-version: '17'
 
       - name: Prepare Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
+        shell: bash
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          fi
+          if [[ -z "${SDKMANAGER:-}" || ! -x "$SDKMANAGER" ]]; then
+            echo 'sdkmanager tidak ditemukan pada runner.' >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
